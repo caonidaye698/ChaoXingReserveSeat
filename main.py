@@ -42,7 +42,7 @@ ENDTIME = "22:01:00"
 START_TIME = "22:00:00"
 
 ENABLE_SLIDER = True
-MAX_ATTEMPT = 1  # 减少到2次尝试，快速失败
+MAX_ATTEMPT = 2  # 减少到2次尝试，快速失败
 RESERVE_NEXT_DAY = True
 MAX_LOOP_ATTEMPTS = 2  # 减少循环次数
 MAX_WORKERS = 1  # 并发线程数
@@ -82,6 +82,8 @@ def execute_single_task(s, username, task, action, task_id):
     try:
         # 不再需要创建 reserve 对象和登录，直接使用传入的 s 对象
         s.requests.headers.update({"Host": "office.chaoxing.com"})
+        # 🔥 关键修复：为每个任务重置max_attempt，确保每个任务都能独立执行
+        s.max_attempt = MAX_ATTEMPT
         success = s.submit(times, roomid, seatid, action)
         
         elapsed = time.time() - start_time
