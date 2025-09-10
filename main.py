@@ -37,14 +37,14 @@ get_current_dayofweek = lambda action: (
 )
 
 # 🚀 性能优化参数设置
-SLEEPTIME = 0.0  # 进一步减少到0.05秒
+SLEEPTIME = 0.05  # 进一步减少到0.05秒
 ENDTIME = "22:01:00"
 START_TIME = "22:00:00"
 
 ENABLE_SLIDER = True
 MAX_ATTEMPT = 1  # 减少到2次尝试，快速失败
-RESERVE_NEXT_DAY = True
-MAX_LOOP_ATTEMPTS = 3  # 减少循环次数
+RESERVE_NEXT_DAY = False
+MAX_LOOP_ATTEMPTS = 2  # 改为 3，只运行三次
 MAX_WORKERS = 1  # 并发线程数
 
 # 🚀 成功率监控（线程安全）
@@ -254,7 +254,6 @@ def main(users, action=False):
     logging.info(f"🎯 Start time reached! Beginning HIGH-SPEED reservation process at {current_time}")
     
     attempt_times = 0
-    consecutive_fail_count = 0
     
     usernames, passwords = None, None
     if action:
@@ -279,10 +278,11 @@ def main(users, action=False):
     
     logging.info(f"📋 Total tasks to complete today: {today_reservation_num}")
     
-    while current_time < ENDTIME and consecutive_fail_count < MAX_LOOP_ATTEMPTS:
+    # 修改循环条件：只执行 MAX_LOOP_ATTEMPTS 次，不管成功失败
+    while attempt_times < MAX_LOOP_ATTEMPTS:
         attempt_times += 1
         attempt_start_time = time.time()
-        logging.info(f"🔄 Starting HIGH-SPEED attempt {attempt_times} (consecutive failures: {consecutive_fail_count})")
+        logging.info(f"🔄 Starting HIGH-SPEED attempt {attempt_times}")
         
         try:
             success_list = login_and_reserve_concurrent(
@@ -290,11 +290,10 @@ def main(users, action=False):
             )
         except Exception as e:
             logging.error(f"💥 An error occurred: {e}")
-            consecutive_fail_count += 1
             current_time = get_current_time(action)
             logging.info(
                 f"attempt time {attempt_times}, time now {current_time}, "
-                f"success list {success_list}, consecutive failures: {consecutive_fail_count}"
+                f"success list {success_list}"
             )
             continue
         
@@ -311,31 +310,22 @@ def main(users, action=False):
         if success_list and successful_tasks == today_reservation_num:
             total_duration = time.time() - success_rate_monitor['start_time']
             logging.info(f"🎉 ALL RESERVATIONS COMPLETED SUCCESSFULLY in {total_duration:.2f}s!")
-            return
+            # 即使全部成功，也要继续执行剩余的尝试次数
         
         # 检查本轮是否有任何成功的预约
         if success_list and successful_tasks > 0:
-            consecutive_fail_count = 0
             logging.info(f"✅ Some reservations succeeded, continuing...")
         else:
-            consecutive_fail_count += 1
-            logging.warning(f"❌ No reservations succeeded in this attempt. Consecutive failures: {consecutive_fail_count}")
-        
-        if consecutive_fail_count >= MAX_LOOP_ATTEMPTS:
-            logging.error(f"💥 Reached maximum consecutive failures ({MAX_LOOP_ATTEMPTS}). Stopping reservation attempts.")
-            break
+            logging.warning(f"❌ No reservations succeeded in this attempt.")
         
         # 🚀 优化：更短的休息时间
-        if consecutive_fail_count == 0:
-            time.sleep(0.1)  # 成功时极短休息
-        else:
-            time.sleep(0.3)  # 失败时短暂休息
+        if attempt_times < MAX_LOOP_ATTEMPTS:  # 只有不是最后一次才休息
+            time.sleep(0.1)
     
     # 最终状态报告
     total_duration = time.time() - success_rate_monitor['start_time']
     
-    if current_time >= ENDTIME:
-        logging.info("⏰ Reached end time, stopping reservation attempts.")
+    logging.info(f"⏰ Completed all {MAX_LOOP_ATTEMPTS} attempts.")
     
     final_success_count = sum(success_list) if success_list else 0
     final_success_rate = (success_rate_monitor['successful_attempts'] / 
