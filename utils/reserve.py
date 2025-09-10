@@ -231,22 +231,16 @@ class reserve:
         return tl[0]
 
     def submit(self, times, roomid, seatid, action):
-        """
-        修改后的submit方法 - 只尝试每个座位一次，不重复尝试同一座位
-        """
         for seat in seatid:
-            logging.info(f"🎯 Trying seat {seat} for time slot {times[0]}-{times[1]}")
-            
-            try:
+            suc = False
+            while ~suc and self.max_attempt > 0:
                 token, value = self._get_page_token(
                     self.url.format(roomid, seat), require_value=True
                 )
                 logging.info(f"Get token: {token}")
-                
                 captcha = self.resolve_captcha() if self.enable_slider else ""
                 logging.info(f"Captcha token {captcha}")
-                
-                success = self.get_submit(
+                suc = self.get_submit(
                     self.submit_url,
                     times=times,
                     token=token,
@@ -256,23 +250,11 @@ class reserve:
                     action=action,
                     value=value,
                 )
-                
-                if success:
-                    logging.info(f"✅ Successfully reserved seat {seat} for {times[0]}-{times[1]}")
-                    return True
-                else:
-                    logging.info(f"❌ Failed to reserve seat {seat} for {times[0]}-{times[1]}")
-                    
-            except Exception as e:
-                logging.error(f"💥 Error trying seat {seat}: {e}")
-                continue
-            
-            # 短暂休息后尝试下一个座位
-            time.sleep(self.sleep_time)
-        
-        # 所有座位都尝试失败
-        logging.info(f"❌ All seats failed for time slot {times[0]}-{times[1]}")
-        return False
+                if suc:
+                    return suc
+                time.sleep(self.sleep_time)
+                self.max_attempt -= 1
+        return suc
 
     def get_submit(
         self, url, times, token, roomid, seatid, captcha="", action=False, value=""
