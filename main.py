@@ -42,8 +42,8 @@ ENDTIME = "22:01:00"
 START_TIME = "22:00:00"
 
 ENABLE_SLIDER = True
-MAX_ATTEMPT = 3  # 减少到2次尝试，快速失败
-RESERVE_NEXT_DAY = True
+MAX_ATTEMPT = 1  # 减少到2次尝试，快速失败
+RESERVE_NEXT_DAY = False
 MAX_LOOP_ATTEMPTS = 3  # 减少循环次数
 MAX_WORKERS = 1  # 并发线程数
 
