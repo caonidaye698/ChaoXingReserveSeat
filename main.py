@@ -39,7 +39,7 @@ get_current_dayofweek = lambda action: (
 # 🚀 性能优化参数设置
 SLEEPTIME = 0.05  # 进一步减少到0.05秒
 ENDTIME = "22:01:00"
-START_TIME = "22:00:00"
+START_TIME = "19:50:00"
 
 ENABLE_SLIDER = True
 MAX_ATTEMPT = 1  # 减少到2次尝试，快速失败
