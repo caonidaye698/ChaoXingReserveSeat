@@ -231,9 +231,12 @@ class reserve:
         return tl[0]
 
     def submit(self, times, roomid, seatid, action):
+        # 为当前这个任务创建一个局部的尝试次数副本
+        attempts_left = self.max_attempt
         for seat in seatid:
             suc = False
-            while ~suc and self.max_attempt > 0:
+            # 在循环条件中使用这个局部计数器
+            while not suc and attempts_left > 0:
                 token, value = self._get_page_token(
                     self.url.format(roomid, seat), require_value=True
                 )
@@ -253,7 +256,8 @@ class reserve:
                 if suc:
                     return suc
                 time.sleep(self.sleep_time)
-                self.max_attempt -= 1
+                # 对局部计数器进行减一操作
+                attempts_left -= 1
         return suc
 
     def get_submit(
