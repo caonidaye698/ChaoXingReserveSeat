@@ -241,7 +241,7 @@ def main(users, action=False):
             remaining_seconds = start_seconds - current_seconds
             
             if remaining_seconds > 1:
-                logging.info(f"Waiting for START_TIME ({START_TIME})... Current time: {current_time}")
+                #logging.info(f"Waiting for START_TIME ({START_TIME})... Current time: {current_time}")
                 time.sleep(1) 
             else:
                 time.sleep(0.001)
