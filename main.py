@@ -42,9 +42,9 @@ ENDTIME = "22:01:00"
 START_TIME = "22:00:00"
 
 ENABLE_SLIDER = True
-MAX_ATTEMPT = 3  # 减少到2次尝试，快速失败
-RESERVE_NEXT_DAY = False
-MAX_LOOP_ATTEMPTS = 1  # 减少循环次数
+MAX_ATTEMPT = 2  # 减少到2次尝试，快速失败
+RESERVE_NEXT_DAY = True
+MAX_LOOP_ATTEMPTS = 2  # 减少循环次数
 MAX_WORKERS = 1  # 并发线程数
 
 # 🚀 成功率监控（线程安全）
@@ -99,9 +99,9 @@ def execute_single_task(s, username, task, action, task_id):
         monitor_success_rate(False)
         return False
 
-def login_and_reserve_sequential(users, usernames, passwords, action, success_list=None):
+def login_and_reserve_concurrent(users, usernames, passwords, action, success_list=None):
     """
-    🔥 顺序执行所有任务 - 确保按时间段顺序预约
+    🔥 优化后的执行逻辑 - 支持并发和会话复用
     """
     logging.info(
         f"🔧 Optimized settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}\nMAX_WORKERS: {MAX_WORKERS}"
@@ -112,8 +112,8 @@ def login_and_reserve_sequential(users, usernames, passwords, action, success_li
     
     current_dayofweek = get_current_dayofweek(action)
     
-    # 🔥 收集所有需要执行的任务，按用户和时间顺序组织
-    all_tasks = []
+    # 🔥 收集所有需要执行的任务, 并按用户分组
+    user_tasks_map = {}
     task_counter = 0
 
     for index, user in enumerate(users):
@@ -125,6 +125,9 @@ def login_and_reserve_sequential(users, usernames, passwords, action, success_li
                 usernames.split(",")[index],
                 passwords.split(",")[index],
             )
+        
+        if username not in user_tasks_map:
+            user_tasks_map[username] = {"password": password, "tasks": []}
 
         # 提取任务
         tasks = user.get("tasks", [])
@@ -138,15 +141,14 @@ def login_and_reserve_sequential(users, usernames, passwords, action, success_li
         
         for task in tasks:
             if current_dayofweek in task["daysofweek"]:
-                all_tasks.append({
-                    "username": username,
-                    "password": password,
+                task_info = {
                     "task": task,
                     "task_id": task_counter,
-                })
+                }
+                user_tasks_map[username]["tasks"].append(task_info)
                 task_counter += 1
 
-    total_tasks = len(all_tasks)
+    total_tasks = task_counter
     if success_list is None:
         success_list = [False] * total_tasks
     
@@ -154,26 +156,22 @@ def login_and_reserve_sequential(users, usernames, passwords, action, success_li
         logging.info("Today not set to reserve")
         return success_list
     
-    logging.info(f"🚀 Using SEQUENTIAL execution for {total_tasks} tasks")
+    logging.info(f"🚀 Using {'CONCURRENT' if MAX_WORKERS > 1 else 'SEQUENTIAL'} execution for {total_tasks} tasks with {MAX_WORKERS} workers")
     
     start_execution_time = time.time()
 
-    # 🔥 关键修改：为每个用户维护一个登录会话
-    user_sessions = {}
-    
-    # 按顺序执行每个任务
-    for task_info in all_tasks:
-        task_id = task_info["task_id"]
-        username = task_info["username"]
-        password = task_info["password"]
-        task = task_info["task"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_task_id = {}
         
-        # 如果该任务已经成功，跳过
-        if success_list[task_id]:
-            continue
+        # 遍历每个用户，登录后提交其所有任务
+        for username, user_data in user_tasks_map.items():
+            password = user_data["password"]
+            tasks_to_run = user_data["tasks"]
             
-        # 如果该用户还没有登录会话，创建并登录
-        if username not in user_sessions:
+            if not tasks_to_run:
+                continue
+
+            # 为每个用户只登录一次
             logging.info(f"Logging in for user: {username}")
             s = reserve(
                 sleep_time=SLEEPTIME,
@@ -187,28 +185,35 @@ def login_and_reserve_sequential(users, usernames, passwords, action, success_li
             if not login_result[0]:
                 logging.error(f"❌ Login failed for {username}: {login_result[1]}")
                 # 将该用户的所有任务标记为失败
-                for other_task in all_tasks:
-                    if other_task["username"] == username:
-                        success_list[other_task["task_id"]] = False
-                        monitor_success_rate(False)
-                continue
-            
-            user_sessions[username] = s
+                for task_info in tasks_to_run:
+                    success_list[task_info["task_id"]] = False
+                    monitor_success_rate(False)
+                continue # 继续处理下一个用户
+
+            # 登录成功, 提交该用户的所有任务
+            for task_info in tasks_to_run:
+                task_id = task_info["task_id"]
+                if not success_list[task_id]:
+                    future = executor.submit(
+                        execute_single_task,
+                        s, # 传入已登录的session
+                        username,
+                        task_info["task"],
+                        action,
+                        task_id
+                    )
+                    future_to_task_id[future] = task_id
         
-        # 使用该用户的会话执行任务
-        try:
-            success = execute_single_task(
-                user_sessions[username],
-                username,
-                task,
-                action,
-                task_id
-            )
-            success_list[task_id] = success
-        except Exception as e:
-            logging.error(f"❌ Task execution error for task {task_id}: {e}")
-            success_list[task_id] = False
-            monitor_success_rate(False)
+        # 等待所有提交的任务完成
+        for future in concurrent.futures.as_completed(future_to_task_id):
+            task_id = future_to_task_id[future]
+            try:
+                result = future.result()
+                success_list[task_id] = result
+            except Exception as e:
+                logging.error(f"❌ Concurrent task execution error for task {task_id}: {e}")
+                success_list[task_id] = False
+                monitor_success_rate(False)
 
     execution_time = time.time() - start_execution_time
     logging.info(f"⚡ Execution completed in {execution_time:.2f}s")
@@ -280,7 +285,7 @@ def main(users, action=False):
         logging.info(f"🔄 Starting HIGH-SPEED attempt {attempt_times} (consecutive failures: {consecutive_fail_count})")
         
         try:
-            success_list = login_and_reserve_sequential(
+            success_list = login_and_reserve_concurrent(
                 users, usernames, passwords, action, success_list
             )
         except Exception as e:
@@ -351,7 +356,7 @@ def debug(users, action=False):
     usernames, passwords = get_user_credentials(action)
 
     try:
-        success_list = login_and_reserve_sequential(
+        success_list = login_and_reserve_concurrent(
             users, usernames, passwords, action
         )
         successful_tasks = sum(success_list) if success_list else 0
@@ -377,7 +382,7 @@ def get_roomid(args1, args2):
 
 if __name__ == "__main__":
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    parser = argparse.ArgumentParser(prog="Chao Xing seat auto reserve - HIGH-SPEED Sequential Version")
+    parser = argparse.ArgumentParser(prog="Chao Xing seat auto reserve - HIGH-SPEED Concurrent Version")
     parser.add_argument("-u", "--user", default=config_path, help="user config file")
     parser.add_argument(
         "-m",
@@ -406,5 +411,5 @@ if __name__ == "__main__":
         exit(1)
 
     
-    logging.info("🚀 Starting HIGH-SPEED sequential seat reservation system...")
+    logging.info("🚀 Starting HIGH-SPEED concurrent seat reservation system...")
     func_dict[args.method](usersdata, args.action)
