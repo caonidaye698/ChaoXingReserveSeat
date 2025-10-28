@@ -1,28 +1,16 @@
 {
-    "reserve": [
-        {
-            "username": "用户1账号",
-            "password": "用户1密码",
-            "tasks": [
-                {
-                    "time": ["9:00", "13:00"],
-                    "roomid": "6913",
-                    "seatid": ["055"],
-                    "daysofweek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday","Saturday" , "Sunday"]
-                },
-                {
-                    "time": ["13:00", "17:00"],
-                    "roomid": "6913",
-                    "seatid": ["055"],
-                    "daysofweek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday","Saturday" , "Sunday"]
-                },
-                {
-                    "time": ["17:00", "21:00"],
-                    "roomid": "6913",
-                    "seatid": ["055"],
-                    "daysofweek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday","Saturday" , "Sunday"]
-                }
-            ]
-        }
-    ]
+  "reserve": [
+    {
+      "username": "",
+      "password": "",
+      "times": [
+        ["13:00", "17:00"],
+        ["17:00", "21:00"],
+        ["9:00", "13:00"]
+      ],
+      "roomid": "6913",
+      "seatid": ["055"],
+      "daysofweek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    }
+  ]
 }
