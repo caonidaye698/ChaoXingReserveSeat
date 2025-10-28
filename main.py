@@ -3,376 +3,381 @@ import time
 import argparse
 import os
 import logging
-import random
-import concurrent.futures
-from threading import Lock
+import datetime
+import threading
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-from utils import reserve
-
-def get_user_credentials(action):
-    """从环境变量中获取用户凭证"""
-    if not action:
-        return None, None
-    usernames = os.environ.get("USERNAMES")
-    passwords = os.environ.get("PASSWORDS")
-    if not usernames or not passwords:
-        logging.error("USERNAMES or PASSWORDS not found in environment variables.")
-        return None, None
-    return usernames, passwords
-
+from utils import reserve, get_user_credentials
 
 get_current_time = lambda action: (
-    time.strftime("%H:%M:%S", time.localtime(time.time() + 8 * 3600))
+    (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%H:%M:%S")
     if action
-    else time.strftime("%H:%M:%S", time.localtime(time.time()))
+    else time.strftime("%H:%M:%S", time.localtime())
 )
 get_current_dayofweek = lambda action: (
-    time.strftime("%A", time.localtime(time.time() + 8 * 3600))
+    (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%A")
     if action
-    else time.strftime("%A", time.localtime(time.time()))
+    else time.strftime("%A", time.localtime())
 )
 
-# 🚀 性能优化参数设置
-SLEEPTIME = 0.05  # 进一步减少到0.05秒
-ENDTIME = "22:01:00"
-START_TIME = "22:00:00"
+SLEEPTIME = 0.01  # 减少间隔时间
+RESERVE_TARGET_TIME = "22:00:00"  # 预约开始的目标时间（北京时间）
+ENABLE_SLIDER = True  # 是否有滑块验证
+MAX_ATTEMPT = 1  # 减少重试次数，专注速度
+RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
+CAPTCHA_POOL_SIZE = 5  # 验证码池大小
+LOGIN_ADVANCE_TIME = 45  # 目标时间前45秒开始登录
+CAPTCHA_PRELOAD_TIME = 5  # 验证码池启动时间（登录后5秒）
 
-ENABLE_SLIDER = True
-MAX_ATTEMPT = 1  # 减少到2次尝试，快速失败
-RESERVE_NEXT_DAY = True
-MAX_LOOP_ATTEMPTS = 2  # 改为 3，只运行三次
-MAX_WORKERS = 1  # 并发线程数
 
-# 🚀 成功率监控（线程安全）
-success_rate_monitor = {
-    'total_attempts': 0,
-    'successful_attempts': 0,
-    'start_time': None,
-    'lock': Lock()
-}
+class CaptchaPool:
+    """验证码缓存池"""
 
-def monitor_success_rate(success):
-    """线程安全的成功率监控"""
-    with success_rate_monitor['lock']:
-        success_rate_monitor['total_attempts'] += 1
-        if success:
-            success_rate_monitor['successful_attempts'] += 1
-        
-        if success_rate_monitor['total_attempts'] > 0:
-            rate = success_rate_monitor['successful_attempts'] / success_rate_monitor['total_attempts'] * 100
-            logging.info(f"📊 Current success rate: {rate:.1f}% ({success_rate_monitor['successful_attempts']}/{success_rate_monitor['total_attempts']})")
+    def __init__(self, session, pool_size=CAPTCHA_POOL_SIZE):
+        self.session = session
+        self.pool_size = pool_size
+        self.captcha_queue = Queue()
+        self.is_active = True
+        self.lock = threading.Lock()
 
-def execute_single_task(s, username, task, action, task_id):
-    """
-    优化后的单任务执行 - 复用已登录的session
-    s: 已经登录成功的 reserve 对象
-    username: 用户名 (用于日志记录)
-    """
-    times = task["time"]
-    roomid = task["roomid"]
-    seatid = task["seatid"]
-    
-    start_time = time.time()
-    logging.info(f"🎯 {username} -- {times} -- {seatid} try (Task {task_id})")
-    
-    try:
-        # 不再需要创建 reserve 对象和登录，直接使用传入的 s 对象
-        s.requests.headers.update({"Host": "office.chaoxing.com"})
-        success = s.submit(times, roomid, seatid, action)
-        
-        elapsed = time.time() - start_time
-        if success:
-            logging.info(f"✅ {username} - {times} - {seatid} SUCCESS in {elapsed:.2f}s (Task {task_id})")
+    def start_preloading(self):
+        """开始预加载验证码"""
+        logging.info(f"🔄 开始预加载验证码池，目标数量: {self.pool_size}")
+
+        def preload_worker():
+            while self.is_active and self.captcha_queue.qsize() < self.pool_size:
+                try:
+                    captcha = self.session.resolve_captcha()
+                    if captcha:
+                        self.captcha_queue.put(captcha)
+                        logging.info(
+                            f"✅ 验证码预加载成功，当前池大小: {self.captcha_queue.qsize()}"
+                        )
+                    time.sleep(0.5)  # 避免请求过快
+                except Exception as e:
+                    logging.warning(f"⚠️ 验证码预加载失败: {e}")
+                    time.sleep(1)
+
+        thread = threading.Thread(target=preload_worker, daemon=True)
+        thread.start()
+
+    def get_captcha(self):
+        """获取一个验证码"""
+        if not self.captcha_queue.empty():
+            return self.captcha_queue.get()
         else:
-            logging.info(f"❌ {username} - {times} - {seatid} FAILED in {elapsed:.2f}s (Task {task_id})")
-        
-        monitor_success_rate(success)
-        return success
-        
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error(f"💥 Task {task_id} error in {elapsed:.2f}s: {e}")
-        monitor_success_rate(False)
-        return False
+            logging.warning("⚠️ 验证码池为空，临时生成验证码")
+            return self.session.resolve_captcha()
 
-def login_and_reserve_concurrent(users, usernames, passwords, action, success_list=None):
-    """
-    🔥 优化后的执行逻辑 - 支持并发和会话复用
-    """
-    logging.info(
-        f"🔧 Optimized settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}\nMAX_WORKERS: {MAX_WORKERS}"
+    def stop(self):
+        """停止预加载"""
+        self.is_active = False
+
+
+def warm_up_session(session, roomid, seatid):
+    """Session预热 - 模拟正常浏览行为"""
+    try:
+        logging.info("🔥 开始Session预热...")
+        session.requests.get(
+            f"https://office.chaoxing.com/front/third/apps/seat/code?id={roomid}&seatNum={seatid[0]}",
+            verify=False,
+        )
+        time.sleep(0.5)
+        session.requests.get(
+            "https://office.chaoxing.com/data/apps/seat/getusedtimes", verify=False
+        )
+        time.sleep(0.5)
+        logging.info("✅ Session预热完成")
+    except Exception as e:
+        logging.warning(f"⚠️ Session预热失败: {e}")
+
+
+def rapid_submit_single(session, times, roomid, seatid, captcha_pool, action, max_retries=2):
+    """极速提交单个预约，增加重试机制"""
+    start_time = time.time()
+    
+    for attempt in range(max_retries):
+        try:
+            # 每次尝试都重新获取验证码和token
+            captcha = captcha_pool.get_captcha()
+            captcha_time = time.time()
+            token, value = session._get_page_token(
+                session.url.format(roomid, seatid), require_value=True
+            )
+            token_time = time.time()
+            logging.info(
+                f"⚡ JIT 获取token: {token} (耗时: {token_time - captcha_time:.2f}s)"
+            )
+
+            success = session.get_submit(
+                session.submit_url,
+                times=times,
+                token=token,
+                roomid=roomid,
+                seatid=seatid,
+                captcha=captcha,
+                action=action,
+                value=value,
+            )
+
+            total_time = time.time() - start_time
+            if success:
+                logging.info(f"🎉 预约成功！总耗时: {total_time:.2f}s")
+                return True
+            else:
+                if attempt < max_retries - 1:
+                    logging.warning(f"❌ 预约失败，尝试第 {attempt + 2} 次，总耗时: {total_time:.2f}s")
+                    time.sleep(0.1)  # 短暂等待后重试
+                else:
+                    logging.warning(f"❌ 预约失败，总耗时: {total_time:.2f}s")
+
+        except Exception as e:
+            total_time = time.time() - start_time
+            if attempt < max_retries - 1:
+                logging.error(f"💥 预约异常: {e}，尝试第 {attempt + 2} 次，总耗时: {total_time:.2f}s")
+                time.sleep(0.1)
+            else:
+                logging.error(f"💥 预约异常: {e}，总耗时: {total_time:.2f}s")
+
+    return False
+
+
+def delayed_login_users(users, usernames, passwords, action):
+    """延迟登录 - 在目标时间前45秒登录"""
+    if action:
+        current_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    else:
+        current_dt = datetime.datetime.now()
+
+    target_dt = current_dt.replace(
+        hour=int(RESERVE_TARGET_TIME.split(":")[0]),
+        minute=int(RESERVE_TARGET_TIME.split(":")[1]),
+        second=int(RESERVE_TARGET_TIME.split(":")[2]),
+        microsecond=0,
     )
+    if target_dt <= current_dt:
+        target_dt += datetime.timedelta(days=1)
+
+    login_dt = target_dt - datetime.timedelta(seconds=LOGIN_ADVANCE_TIME)
+    wait_seconds = (login_dt - current_dt).total_seconds()
     
-    if action and usernames and len(usernames.split(",")) != len(users):
-        raise Exception("user number should match the number of config")
+    if wait_seconds > 0:
+        logging.info(f"将在 {wait_seconds:.1f} 秒后开始登录 (目标时间前{LOGIN_ADVANCE_TIME}s)")
+        time.sleep(wait_seconds)
+
+    logging.info(f"🚀 开始延迟登录策略，距离预约开始还有 {LOGIN_ADVANCE_TIME} 秒")
     
+    logged_sessions = []
+    captcha_pools = []
     current_dayofweek = get_current_dayofweek(action)
-    
-    # 🔥 收集所有需要执行的任务, 并按用户分组
-    user_tasks_map = {}
-    task_counter = 0
 
     for index, user in enumerate(users):
-        # 提取用户名和密码
-        username = user["username"]
-        password = user["password"]
-        if action and usernames:
+        username, password, times, roomid, seatid, daysofweek = user.values()
+        if action:
             username, password = (
                 usernames.split(",")[index],
                 passwords.split(",")[index],
             )
-        
-        if username not in user_tasks_map:
-            user_tasks_map[username] = {"password": password, "tasks": []}
 
-        # 提取任务
-        tasks = user.get("tasks", [])
-        if not tasks and "time" in user: # 兼容旧格式
-            tasks = [{
-                "time": user["time"],
-                "roomid": user["roomid"],
-                "seatid": user["seatid"] if isinstance(user["seatid"], list) else [user["seatid"]],
-                "daysofweek": user["daysofweek"]
-            }]
-        
-        for task in tasks:
-            if current_dayofweek in task["daysofweek"]:
-                task_info = {
-                    "task": task,
-                    "task_id": task_counter,
-                }
-                user_tasks_map[username]["tasks"].append(task_info)
-                task_counter += 1
+        if current_dayofweek not in daysofweek:
+            logging.info("Today not set to reserve")
+            logged_sessions.append(None)
+            captcha_pools.append(None)
+            continue
 
-    total_tasks = task_counter
-    if success_list is None:
-        success_list = [False] * total_tasks
-    
-    if total_tasks == 0:
-        logging.info("Today not set to reserve")
-        return success_list
-    
-    logging.info(f"🚀 Using {'CONCURRENT' if MAX_WORKERS > 1 else 'SEQUENTIAL'} execution for {total_tasks} tasks with {MAX_WORKERS} workers")
-    
-    start_execution_time = time.time()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_task_id = {}
+        logging.info(f"User {username}: 快速登录中...")
+        start_login_time = time.time()
         
-        # 遍历每个用户，登录后提交其所有任务
-        for username, user_data in user_tasks_map.items():
-            password = user_data["password"]
-            tasks_to_run = user_data["tasks"]
+        s = reserve(
+            sleep_time=SLEEPTIME,
+            max_attempt=MAX_ATTEMPT,
+            enable_slider=ENABLE_SLIDER,
+            reserve_next_day=RESERVE_NEXT_DAY,
+        )
+        s.get_login_status()
+        login_success, msg = s.login(username, password)
+        
+        login_elapsed = time.time() - start_login_time
+        logging.info(f"User {username}: 登录耗时 {login_elapsed:.2f}s")
+
+        if login_success:
+            s.requests.headers.update({"Host": "office.chaoxing.com"})
+            warm_up_session(s, roomid, seatid)
             
-            if not tasks_to_run:
-                continue
+            # 立即启动验证码池
+            captcha_pool = CaptchaPool(s, CAPTCHA_POOL_SIZE)
+            captcha_pool.start_preloading()
+            
+            logged_sessions.append(s)
+            captcha_pools.append(captcha_pool)
+        else:
+            logging.error(f"User {username} login failed: {msg}")
+            logged_sessions.append(None)
+            captcha_pools.append(None)
 
-            # 为每个用户只登录一次
-            logging.info(f"Logging in for user: {username}")
-            s = reserve(
-                sleep_time=SLEEPTIME,
-                max_attempt=MAX_ATTEMPT,
-                enable_slider=ENABLE_SLIDER,
-                reserve_next_day=RESERVE_NEXT_DAY,
-            )
-            s.get_login_status()
-            login_result = s.login(username, password)
+    return logged_sessions, captcha_pools
 
-            if not login_result[0]:
-                logging.error(f"❌ Login failed for {username}: {login_result[1]}")
-                # 将该用户的所有任务标记为失败
-                for task_info in tasks_to_run:
-                    success_list[task_info["task_id"]] = False
-                    monitor_success_rate(False)
-                continue # 继续处理下一个用户
 
-            # 登录成功, 提交该用户的所有任务
-            for task_info in tasks_to_run:
-                task_id = task_info["task_id"]
-                if not success_list[task_id]:
-                    future = executor.submit(
-                        execute_single_task,
-                        s, # 传入已登录的session
-                        username,
-                        task_info["task"],
-                        action,
-                        task_id
-                    )
-                    future_to_task_id[future] = task_id
-        
-        # 等待所有提交的任务完成
-        for future in concurrent.futures.as_completed(future_to_task_id):
-            task_id = future_to_task_id[future]
-            try:
-                result = future.result()
-                success_list[task_id] = result
-            except Exception as e:
-                logging.error(f"❌ Concurrent task execution error for task {task_id}: {e}")
-                success_list[task_id] = False
-                monitor_success_rate(False)
+def wait_for_target_time(target_time, action):
+    """等待到达目标时间"""
+    current_time = get_current_time(action)
+    if current_time < target_time:
+        if action:
+            current_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        else:
+            current_dt = datetime.datetime.now()
 
-    execution_time = time.time() - start_execution_time
-    logging.info(f"⚡ Execution completed in {execution_time:.2f}s")
-    
-    return success_list
+        target_dt = current_dt.replace(
+            hour=int(target_time.split(":")[0]),
+            minute=int(target_time.split(":")[1]),
+            second=int(target_time.split(":")[2]),
+            microsecond=0,
+        )
+        if target_dt <= current_dt:
+            target_dt += datetime.timedelta(days=1)
+
+        wait_seconds = (target_dt - current_dt).total_seconds()
+        logging.info(
+            f"距离目标时间 {target_time}（北京时间）还有 {wait_seconds:.1f} 秒，最终等待中..."
+        )
+        time.sleep(wait_seconds)
+
+    logging.info(f"⏰ 到达目标时间 {target_time}（北京时间），开始预约")
+
+
+def parallel_submit(session, time_slot, roomid, seatid, captcha_pool, action):
+    """并行提交封装"""
+    return rapid_submit_single(session, time_slot, roomid, seatid, captcha_pool, action)
+
+
+def start_reservation_parallel(users, logged_sessions, captcha_pools, action):
+    """并行极速预约（限制 2 路并发）"""
+    current_dayofweek = get_current_dayofweek(action)
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = user.values()
+        if current_dayofweek not in daysofweek:
+            continue
+
+        s = logged_sessions[index]
+        captcha_pool = captcha_pools[index]
+        if s is None or captcha_pool is None:
+            continue
+
+        logging.info(f"🚀 并行极速预约 - 用户 {username}")
+        time_slots = times if isinstance(times[0], list) else [times]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    parallel_submit, s, slot, roomid, seatid[0], captcha_pool, action
+                )
+                for slot in time_slots
+            ]
+            for f in futures:
+                try:
+                    if f.result():
+                        logging.info("✅ 并行预约成功！")
+                    else:
+                        logging.warning("❌ 并行预约失败！")
+                except Exception as e:
+                    logging.error(f"💥 并行异常: {e}")
+
+        captcha_pool.stop()
 
 
 def main(users, action=False):
-    # 🚀 初始化成功率监控
-    success_rate_monitor['start_time'] = time.time()
-    
-    current_time = get_current_time(action)
-    logging.info(f"🚀 Optimized program started at {current_time}, action {'on' if action else 'off'}")
-    
-    # 🚀 精确等待启动时间
-    while current_time < START_TIME:
-        try:
-            start_time_obj = time.strptime(START_TIME, "%H:%M:%S")
-            current_time_obj = time.strptime(current_time, "%H:%M:%S")
-
-            # Convert to seconds from midnight
-            start_seconds = start_time_obj.tm_hour * 3600 + start_time_obj.tm_min * 60 + start_time_obj.tm_sec
-            current_seconds = current_time_obj.tm_hour * 3600 + current_time_obj.tm_min * 60 + current_time_obj.tm_sec
-
-            remaining_seconds = start_seconds - current_seconds
-            
-            if remaining_seconds > 1:
-                #logging.info(f"Waiting for START_TIME ({START_TIME})... Current time: {current_time}")
-                time.sleep(1) 
-            else:
-                time.sleep(0.001)
-        except ValueError:
-            logging.error("Invalid time format in START_TIME. Please use HH:MM:SS.")
-            return
-
-        current_time = get_current_time(action)
-    
-    logging.info(f"🎯 Start time reached! Beginning HIGH-SPEED reservation process at {current_time}")
-    
-    attempt_times = 0
-    
+    logging.info(f"程序启动，采用延迟登录策略 (action={'on' if action else 'off'})")
     usernames, passwords = None, None
     if action:
         usernames, passwords = get_user_credentials(action)
-    success_list = None
-    current_dayofweek = get_current_dayofweek(action)
+
+    # 延迟登录，在目标时间前45秒登录
+    logged_sessions, captcha_pools = delayed_login_users(
+        users, usernames, passwords, action
+    )
+
+    # 等待到达精确的目标时间
+    wait_for_target_time(RESERVE_TARGET_TIME, action)
     
-    # 计算今天需要执行的任务总数
-    today_reservation_num = 0
-    for user in users:
-        tasks = user.get("tasks", [])
-        if not tasks and "time" in user: # 兼容旧格式
-             tasks = [user]
-        
-        today_reservation_num += sum(
-            1 for task in tasks if current_dayofweek in task.get("daysofweek", [])
-        )
-    
-    if today_reservation_num == 0:
-        logging.info("Today not set to reserve, exiting...")
-        return
-    
-    logging.info(f"📋 Total tasks to complete today: {today_reservation_num}")
-    
-    # 修改循环条件：只执行 MAX_LOOP_ATTEMPTS 次，不管成功失败
-    while attempt_times < MAX_LOOP_ATTEMPTS:
-        attempt_times += 1
-        attempt_start_time = time.time()
-        logging.info(f"🔄 Starting HIGH-SPEED attempt {attempt_times}")
-        
-        try:
-            success_list = login_and_reserve_concurrent(
-                users, usernames, passwords, action, success_list
-            )
-        except Exception as e:
-            logging.error(f"💥 An error occurred: {e}")
-            current_time = get_current_time(action)
-            logging.info(
-                f"attempt time {attempt_times}, time now {current_time}, "
-                f"success list {success_list}"
-            )
-            continue
-        
-        current_time = get_current_time(action)
-        successful_tasks = sum(success_list) if success_list else 0
-        attempt_duration = time.time() - attempt_start_time
-        
-        logging.info(
-            f"⚡ Attempt {attempt_times} completed in {attempt_duration:.2f}s, time now {current_time}, "
-            f"success list {success_list} ({successful_tasks}/{today_reservation_num} tasks completed)"
-        )
-        
-        # 检查是否全部预约成功
-        if success_list and successful_tasks == today_reservation_num:
-            total_duration = time.time() - success_rate_monitor['start_time']
-            logging.info(f"🎉 ALL RESERVATIONS COMPLETED SUCCESSFULLY in {total_duration:.2f}s!")
-            # 即使全部成功，也要继续执行剩余的尝试次数
-        
-        # 检查本轮是否有任何成功的预约
-        if success_list and successful_tasks > 0:
-            logging.info(f"✅ Some reservations succeeded, continuing...")
-        else:
-            logging.warning(f"❌ No reservations succeeded in this attempt.")
-        
-        # 🚀 优化：更短的休息时间
-        if attempt_times < MAX_LOOP_ATTEMPTS:  # 只有不是最后一次才休息
-            time.sleep(0.1)
-    
-    # 最终状态报告
-    total_duration = time.time() - success_rate_monitor['start_time']
-    
-    logging.info(f"⏰ Completed all {MAX_LOOP_ATTEMPTS} attempts.")
-    
-    final_success_count = sum(success_list) if success_list else 0
-    final_success_rate = (success_rate_monitor['successful_attempts'] / 
-                         max(success_rate_monitor['total_attempts'], 1) * 100)
-    
-    if final_success_count > 0:
-        logging.info(f"✅ Final result: {final_success_count}/{today_reservation_num} reservations completed successfully in {total_duration:.2f}s!")
-    else:
-        logging.info(f"❌ Final result: No reservations were successful in {total_duration:.2f}s.")
-    
-    logging.info(f"📊 Overall success rate: {final_success_rate:.1f}% ({success_rate_monitor['successful_attempts']}/{success_rate_monitor['total_attempts']})")
+    # 开始并行预约
+    start_reservation_parallel(users, logged_sessions, captcha_pools, action)
+
 
 def debug(users, action=False):
-    """
-    调试模式，立即执行一次预约任务，忽略 START_TIME
-    """
-    logging.info("🐛 Running in DEBUG mode. Bypassing start time check and executing one attempt.")
-    usernames, passwords = get_user_credentials(action)
+    logging.info(
+        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nRESERVE_TARGET_TIME: {RESERVE_TARGET_TIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}\nCAPTCHA_POOL_SIZE: {CAPTCHA_POOL_SIZE}\nLOGIN_ADVANCE_TIME: {LOGIN_ADVANCE_TIME}"
+    )
+    logging.info(f"Debug Mode start! , action {'on' if action else 'off'}")
+    if action:
+        usernames, passwords = get_user_credentials(action)
 
-    try:
-        success_list = login_and_reserve_concurrent(
-            users, usernames, passwords, action
+    current_dayofweek = get_current_dayofweek(action)
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = user.values()
+        if type(seatid) == str:
+            seatid = [seatid]
+        if action:
+            username, password = (
+                usernames.split(",")[index],
+                passwords.split(",")[index],
+            )
+        if current_dayofweek not in daysofweek:
+            logging.info("Today not set to reserve")
+            continue
+        logging.info(
+            f"----------- {username} -- {times} -- {seatid} try -----------"
         )
-        successful_tasks = sum(success_list) if success_list else 0
-        logging.info(f"🐛 DEBUG run finished. Success list: {success_list}. Successful tasks: {successful_tasks}")
-    except Exception as e:
-        logging.error(f"💥 An error occurred during DEBUG run: {e}", exc_info=True)
+        s = reserve(
+            sleep_time=SLEEPTIME,
+            max_attempt=MAX_ATTEMPT,
+            enable_slider=ENABLE_SLIDER,
+            reserve_next_day=RESERVE_NEXT_DAY,
+        )
+        s.get_login_status()
+        s.login(username, password)
+        s.requests.headers.update({"Host": "office.chaoxing.com"})
+
+        captcha_pool = CaptchaPool(s, 3)
+        captcha_pool.start_preloading()
+        time.sleep(2)
+
+        if isinstance(times[0], list):
+            for time_slot in times:
+                rapid_submit_single(
+                    s, time_slot, roomid, seatid[0], captcha_pool, action
+                )
+                time.sleep(0.3)
+        else:
+            rapid_submit_single(s, times, roomid, seatid[0], captcha_pool, action)
+
+        captcha_pool.stop()
+        return
 
 
 def get_roomid(args1, args2):
-    """获取指定教学楼的房间ID"""
-    s = reserve()
-    username, password = get_user_credentials(args2)
-    if not username or not password:
-        with open(args1, "r+") as data:
-            usersdata = json.load(data)["reserve"]
-            username, password = usersdata[0]['username'], usersdata[0]['password']
-    
+    username = input("请输入用户名：")
+    password = input("请输入密码：")
+    s = reserve(
+        sleep_time=SLEEPTIME,
+        max_attempt=MAX_ATTEMPT,
+        enable_slider=ENABLE_SLIDER,
+        reserve_next_day=RESERVE_NEXT_DAY,
+    )
     s.get_login_status()
-    s.login(username, password)
-    encode = input("Please input the encode of the building: ")
+    s.login(username=username, password=password)
+    s.requests.headers.update({"Host": "office.chaoxing.com"})
+    encode = input("请输入deptldEnc：")
     s.roomid(encode)
 
 
 if __name__ == "__main__":
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    parser = argparse.ArgumentParser(prog="Chao Xing seat auto reserve - HIGH-SPEED Concurrent Version")
+    parser = argparse.ArgumentParser(prog="Chao Xing seat auto reserve")
     parser.add_argument("-u", "--user", default=config_path, help="user config file")
     parser.add_argument(
         "-m",
@@ -389,17 +394,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     func_dict = {"reserve": main, "debug": debug, "room": get_roomid}
-    
-    try:
-        with open(args.user, "r", encoding="utf-8") as data:
-            usersdata = json.load(data)["reserve"]
-    except FileNotFoundError:
-        logging.error(f"Config file not found at: {args.user}")
-        exit(1)
-    except json.JSONDecodeError:
-        logging.error(f"Error decoding JSON from the config file: {args.user}")
-        exit(1)
-
-    
-    logging.info("🚀 Starting HIGH-SPEED concurrent seat reservation system...")
+    with open(args.user, "r+") as data:
+        usersdata = json.load(data)["reserve"]
     func_dict[args.method](usersdata, args.action)
